@@ -1,6 +1,5 @@
 from tqdm import tqdm
 from nltk import word_tokenize
-import os
 import pandas as pd
 import sqlite3
 import re
@@ -9,11 +8,7 @@ from dataflow import get_logger
 from dataflow.core import OperatorABC
 from dataflow.utils.storage import DataFlowStorage
 
-
 class Schema:
-    """
-    Simple schema which maps table&column to a unique identifier
-    """
     def __init__(self, schema):
         self._schema = self._normalize_schema(schema)
         self._idMap = self._map(self._schema)
@@ -45,9 +40,6 @@ class Schema:
     
 
 class EvalHardness:
-    """
-    Tokenize SQL query and parse SQL query
-    """
     CLAUSE_KEYWORDS = ('select', 'from', 'where', 'group', 'order', 'limit', 'intersect', 'union', 'except')
     JOIN_KEYWORDS = ('join', 'on', 'as')
 
@@ -651,14 +643,24 @@ class EvalHardness:
 
 
 class EvalHardnessLite:
-    def __init__(self, sql: str):
+    def __init__(self, sql: str, difficulty_config: dict):
         self.sql = sql.lower()
+        self.difficulty_config = difficulty_config
 
     def match(self, pattern):
         return bool(re.search(pattern, self.sql))
 
     def count_keyword(self, keyword):
         return self.sql.count(keyword)
+    
+    def classify_difficulty(self, score: int) -> str:
+        thresholds = self.difficulty_config['thresholds']
+        labels = self.difficulty_config['labels']
+        
+        for i, threshold in enumerate(thresholds):
+            if score <= threshold:
+                return labels[i]
+        return labels[-1]
 
     def run(self):
         sql = self.sql
@@ -696,29 +698,20 @@ class EvalHardnessLite:
         if any(op in sql for op in ['union', 'intersect', 'except']):
             score += 2
 
-        # 多列 SELECT
         select_cols = re.findall(r'select\s+(distinct\s+)?(.+?)\s+from', sql, re.DOTALL)
         if select_cols:
             num_commas = select_cols[0][1].count(',')
             if num_commas >= 1:
                 score += 1
 
-        # 简单规则分类
-        if score <= 2:
-            return 'easy'
-        elif score <= 4:
-            return 'medium'
-        elif score <= 6:
-            return 'hard'
-        else:
-            return 'extra'
+        difficulty = self.classify_difficulty(score)
+        return difficulty
 
 
 @OPERATOR_REGISTRY.register()
-class SQLDifficultyClassifier(OperatorABC):
-    def __init__(self, max_score: int = 2.0, min_score: int = 0.9):
-        self.max_score = max_score
-        self.min_score = min_score
+class ComponentClassifier(OperatorABC):
+    def __init__(self, difficulty_config: dict):
+        self.difficulty_config = difficulty_config
         self.logger = get_logger()
 
     @staticmethod
@@ -745,13 +738,6 @@ class SQLDifficultyClassifier(OperatorABC):
             return "AnswerExtraction_qwenmatheval performs mathematical answer normalization and standardization."
 
     def get_schema(self, db):
-        """
-        Get database's schema, which is a dict with table name as key
-        and list of column names as value
-        :param db: database path
-        :return: schema dict
-        """
-
         schema = {}
         conn = sqlite3.connect(db)
         cursor = conn.cursor()
@@ -766,9 +752,6 @@ class SQLDifficultyClassifier(OperatorABC):
         return schema    
     
     def report_statistics(self, dataframe: pd.DataFrame):
-        '''
-        print the statistics of the SQL difficulty.
-        '''
         counts = dataframe[self.output_difficulty_key].value_counts()
         self.logger.info("SQL Difficulty Statistics")
         difficulty_counts = {d: counts.get(d, 0) for d in ['easy', 'medium', 'hard', 'extra']}
@@ -784,7 +767,7 @@ class SQLDifficultyClassifier(OperatorABC):
         
         for idx, row in tqdm(dataframe.iterrows(), total=len(dataframe), desc="Processing"):
             sql = row.get(self.input_sql_key)
-            sql_hardness = EvalHardnessLite(sql)
+            sql_hardness = EvalHardnessLite(sql, self.difficulty_config)
             hardness = sql_hardness.run()
             dataframe.at[idx, self.output_difficulty_key] = hardness
 

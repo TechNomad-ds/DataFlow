@@ -14,24 +14,22 @@ from dataflow.utils.storage import DataFlowStorage
 
 
 @OPERATOR_REGISTRY.register()
-class Text2SQLDifficultyClassifier(OperatorABC):
-    def __init__(self, llm_serving: LLMServingABC, db_root_path: str, num_cpus: int = 1, meta_time_out: float = 120.0, easy_medium: int = 9, medium_hard: int = 5, hard_extra: int = 2):
+class ExecutionClassifier(OperatorABC):
+    def __init__(self, llm_serving: LLMServingABC, db_root_path: str, meta_time_out: float = 120.0, difficulty_config: dict = None, num_generations: int = 10, batch_size: int = 50):
         self.llm_serving = llm_serving     
         self.db_root_path = db_root_path
-        self.num_cpus = num_cpus
         self.meta_time_out = meta_time_out
-        self.easy_medium = easy_medium
-        self.medium_hard = medium_hard
-        self.hard_extra = hard_extra
+        if difficulty_config is None:
+            self.difficulty_config = {
+                'thresholds': [2, 5, 9],
+                'labels': ['extra', 'hard', 'medium', 'easy']
+            }
+        else:
+            self.difficulty_config = difficulty_config
+        self.num_generations = num_generations
+        self.batch_size = batch_size 
+        self.num_cpus = os.cpu_count() if os.cpu_count() else 20
         self.logger = get_logger()
-
-        self.difficulty_map = {
-            "easy": 0,
-            "medium": 1,
-            "hard": 2,
-            "extra": 3,
-            "gold error": 4
-        }
 
     @staticmethod
     def get_desc(lang):
@@ -104,13 +102,13 @@ class Text2SQLDifficultyClassifier(OperatorABC):
         cnt_true = 0
         
         try:
-            ground_truth_res = func_timeout(meta_time_out, Text2SQLDifficultyClassifier.execute_sql,
+            ground_truth_res = func_timeout(meta_time_out, ExecutionClassifier.execute_sql,
                                         args=(ground_truth, db_place))
             
             for predicted_sql in predicted_sqls:
                 res = 0
                 try:
-                    predicted_res = func_timeout(meta_time_out, Text2SQLDifficultyClassifier.execute_sql,
+                    predicted_res = func_timeout(meta_time_out, ExecutionClassifier.execute_sql,
                                             args=(predicted_sql, db_place))
                     if set(predicted_res) == set(ground_truth_res):
                         res = 1
@@ -148,7 +146,7 @@ class Text2SQLDifficultyClassifier(OperatorABC):
             db_id = data_pair[self.input_dbid_key].replace('\n', '')
             db_id = re.sub(r'[^A-Za-z0-9_]', '', db_id)
             db_place = os.path.join(db_root_path.rstrip('/'), db_id, f"{db_id}.sqlite")
-            return Text2SQLDifficultyClassifier.execute_model(predicted_sqls, ground_truth, db_place, idx, meta_time_out, self.logger)
+            return ExecutionClassifier.execute_model(predicted_sqls, ground_truth, db_place, idx, meta_time_out, self.logger)
 
         with ThreadPoolExecutor(max_workers=num_cpus) as executor:
             futures = [
@@ -170,32 +168,35 @@ class Text2SQLDifficultyClassifier(OperatorABC):
 
     def sort_results(self, list_of_dicts):
         return sorted(list_of_dicts, key=lambda x: x['idx'])
-    
-    def get_difficulty(self, cnt_true):
-        if cnt_true == -1:
-            return "gold error"
-        elif cnt_true >= self.easy_medium:
-            return "easy"
-        elif cnt_true >= self.medium_hard:
-            return "medium"
-        elif cnt_true >= self.hard_extra:
-            return "hard"
-        else:
-            return "extra"
         
     def report_statistics(self, dataframe: pd.DataFrame):
         counts = dataframe[self.output_difficulty_key].value_counts()
         self.logger.info("SQL Difficulty Statistics")
         stats = [f"{difficulty.title()}: {counts.get(difficulty, 0)}" for difficulty in ['easy', 'medium', 'hard', 'extra']]
         self.logger.info(", ".join(stats))
-
-    def process_single_question(self, question):
+        
+    def process_batch_questions(self, questions):
         try:
-            result = self.llm_serving.generate_from_input(question)
-            return result[0] if result else ""
+            responses = self.llm_serving.generate_from_input(questions)
+            if len(responses) != len(questions):
+                self.logger.warning(f"Expected {len(questions)} responses but got {len(responses)}")
+                while len(responses) < len(questions):
+                    responses.append("")
+            return responses
         except Exception as e:
-            self.logger.error(f"Error processing question: {e}")
-            return ""
+            self.logger.error(f"Error in batch processing: {e}")
+            return [""] * len(questions)
+        
+    def classify_difficulty(self, score):
+        if score == -1:
+            return "gold error"
+        thresholds = self.difficulty_config['thresholds']
+        labels = self.difficulty_config['labels']
+        
+        for i, threshold in enumerate(thresholds):
+            if score <= threshold:
+                return labels[i]
+        return labels[-1]
 
     def run(self, storage: DataFlowStorage,
             input_dbid_key: str = "db_id",
@@ -214,34 +215,30 @@ class Text2SQLDifficultyClassifier(OperatorABC):
         dataframe = storage.read("dataframe")
         input_prompts = dataframe[self.input_prompt_key].tolist()
         
-        self.logger.info(f"Processing {len(input_prompts)} questions, generating 10 SQLs each...")
-        repeated_questions = [q for q in input_prompts for _ in range(10)]
+        self.logger.info(f"Processing {len(input_prompts)} questions, generating {self.num_generations} SQLs each...")
         
-        responses = []
-        with ThreadPoolExecutor(max_workers=self.num_cpus) as executor:
-            futures = {
-                executor.submit(self.process_single_question, question): idx
-                for idx, question in enumerate(tqdm(repeated_questions, desc="Generating SQLs"))
-            }
-
-            results_buffer = [None] * len(repeated_questions)
-
-            for future in tqdm(as_completed(futures), total=len(repeated_questions), desc="Collecting responses"):
-                idx = futures[future]
-                try:
-                    result = future.result()
-                    results_buffer[idx] = result
-                except Exception as e:
-                    self.logger.error(f"Error retrieving future result: {e}")
-                    results_buffer[idx] = ""
-
-        responses = results_buffer
-
+        repeated_questions = [q for q in input_prompts for _ in range(self.num_generations)]
+        
+        all_responses = []
+        total_batches = (len(repeated_questions) + self.batch_size - 1) // self.batch_size
+        
+        for batch_start in range(0, len(repeated_questions), self.batch_size):
+            batch_end = min(batch_start + self.batch_size, len(repeated_questions))
+            batch_questions = repeated_questions[batch_start:batch_end]
+            
+            current_batch = batch_start // self.batch_size + 1
+            self.logger.info(f"Processing batch {current_batch}/{total_batches} ({len(batch_questions)} questions)")
+            
+            batch_responses = self.process_batch_questions(batch_questions)
+            all_responses.extend(batch_responses)
+        
+        responses = all_responses
+        
         datas = dataframe.to_dict(orient='records')
         
         for i, data in enumerate(datas):
-            start_idx = i * 10
-            end_idx = start_idx + 10
+            start_idx = i * self.num_generations
+            end_idx = start_idx + self.num_generations
             question_responses = responses[start_idx:end_idx]
             
             parsed_sqls = []
@@ -263,7 +260,7 @@ class Text2SQLDifficultyClassifier(OperatorABC):
             if execres is not None:
                 idx = execres["idx"]
                 cnt_true = execres["cnt_true"]
-                datas[idx][self.output_difficulty_key] = self.get_difficulty(cnt_true)
+                datas[idx][self.output_difficulty_key] = self.classify_difficulty(cnt_true)
                 datas[idx][self.output_cnt_true_key] = cnt_true
         
         for data in datas:
@@ -273,10 +270,6 @@ class Text2SQLDifficultyClassifier(OperatorABC):
         dataframe = pd.DataFrame(datas)
         
         self.report_statistics(dataframe)
-        
-        gold_error_count = len(dataframe[dataframe[self.output_difficulty_key] == "gold error"])
-        if gold_error_count > 0:
-            self.logger.warning(f"Found {gold_error_count} questions with gold SQL errors")
         
         difficulty_counts = dataframe[self.output_difficulty_key].value_counts()
         self.logger.info("\nDifficulty Distribution:")

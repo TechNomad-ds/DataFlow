@@ -1,19 +1,16 @@
-from .DatabaseSchemaExtractor import DatabaseSchemaExtractor
-from .ExtraKnowledgeGenerator import ExtraKnowledgeGenerator
-from .PromptGenerator import PromptGenerator
-from .QuestionRefiner import QuestionRefiner
-from .SchemaLinking import SchemaLinking
-from .SQLDifficultyClassifier import SQLDifficultyClassifier
 from .SQLFilter import SQLFilter
-from .Text2SQLDifficultyClassifier import Text2SQLDifficultyClassifier
+from .ComponentClassifier import ComponentClassifier
+from .SchemaExtractor import SchemaExtractor
+from .QuestionRefiner import QuestionRefiner
+from .QAGenerator import QAGenerator
+from .ExecutionClassifier import ExecutionClassifier
+
 
 __all__ = [
-    "DatabaseSchemaExtractor",
-    "ExtraKnowledgeGenerator",
-    "PromptGenerator",
-    "QuestionRefiner",
-    "SchemaLinking",
-    "SQLDifficultyClassifier",
     "SQLFilter",
-    "Text2SQLDifficultyClassifier"
+    "ComponentClassifier",
+    "SchemaExtractor",
+    "QuestionRefiner",
+    "QAGenerator",
+    "ExecutionClassifier"
 ]

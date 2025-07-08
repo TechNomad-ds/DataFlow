@@ -1,7 +1,7 @@
-from typing import Dict, Union
+from typing import Dict, List, Tuple
 import pandas as pd
+import os
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataflow.prompts.text2sql import QuestionRefinePrompt
 from dataflow.utils.registry import OPERATOR_REGISTRY
 from dataflow import get_logger
@@ -12,12 +12,12 @@ from dataflow.utils.storage import DataFlowStorage
 
 @OPERATOR_REGISTRY.register()
 class QuestionRefiner(OperatorABC):
-    def __init__(self, llm_serving: LLMServingABC, num_threads: int = 5, max_retries: int = 3): 
+    def __init__(self, llm_serving: LLMServingABC): 
         self.llm_serving = llm_serving       
         self.prompt = QuestionRefinePrompt()
         self.logger = get_logger()
-        self.num_threads = num_threads
-        self.max_retries = max_retries
+        self.num_threads = os.cpu_count() if os.cpu_count() else 20
+        self.max_retries = 3
 
     @staticmethod
     def get_desc(lang):
@@ -42,9 +42,9 @@ class QuestionRefiner(OperatorABC):
         else:
             return "AnswerExtraction_qwenmatheval performs mathematical answer normalization and standardization."
 
-    def _generate_prompt(self, item: Dict) -> str:
-        return self.prompt.question_refine_prompt(item['question'])
-    
+    def _generate_prompts_batch(self, items: List[Dict]) -> List[str]:
+        return [self.prompt.question_refine_prompt(item[self.input_question_key]) for item in items]
+
     def _parse_response(self, response: str, original_question: str) -> str:
         if not response:
             return original_question
@@ -63,63 +63,64 @@ class QuestionRefiner(OperatorABC):
             self.logger.warning(f"Unexpected response format: {response[:200]}...")
             return original_question
 
-    def _process_item_with_retry(self, item: Dict, retry_count: int = 2) -> Dict:
+    def _process_batch_with_retry(self, batch_items: List[Tuple[int, Dict]], retry_count: int = 0) -> List[Tuple[int, Dict]]:
         try:
-            prompt = self._generate_prompt(item)
-            response = self.llm_serving.generate_from_input([prompt])
-            parsed_response = self._parse_response(response[0], item['question'])
+            indices = [idx for idx, _ in batch_items]
+            items = [item for _, item in batch_items]
+            prompts = self._generate_prompts_batch(items)
+            responses = self.llm_serving.generate_from_input(prompts)
+            results = []
+            for idx, item, response in zip(indices, items, responses):
+                parsed_response = self._parse_response(response, item[self.input_question_key])
+                results.append((idx, {
+                    **item,
+                    self.output_refined_question_key: parsed_response
+                }))
             
-            return {
-                **item,
-                self.output_refined_question_key: parsed_response
-            }
-        
+            return results
+            
         except Exception as e:
-            if retry_count < self.max_retries:
-                self.logger.warning(f"Retrying {item.get('id')} (attempt {retry_count + 1}): {str(e)}")
-                return self._process_item_with_retry(item, retry_count + 1)
+            self.logger.error(f"Batch processing error: {e}")
 
-            return {
-                **item,
-                self.output_refined_question_key: item['question']
-            }
+            if retry_count < self.max_retries:
+                self.logger.warning(f"Retrying batch (attempt {retry_count + 1})")
+                return self._process_batch_with_retry(batch_items, retry_count + 1)
+            else:
+                self.logger.warning("Batch processing failed, using original questions")
+                results = []
+                for idx, item in batch_items:
+                    results.append((idx, {
+                        **item,
+                        self.output_refined_question_key: item[self.input_question_key]
+                    }))
+                return results
 
     def run(self, storage: DataFlowStorage,
             input_question_key: str = "question",
-            output_refined_question_key: str = "refined_question"
+            output_refined_question_key: str = "refined_question",
+            batch_size: int = 50
         ):
         self.input_question_key = input_question_key
         self.output_refined_question_key = output_refined_question_key
 
-        self.logger.info("Starting QuestionRefiner...")
+        self.logger.info("Starting QuestionRefiner with batch processing...")
         raw_dataframe = storage.read("dataframe")
         items = raw_dataframe.to_dict('records')
         
-        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
-            futures = {
-                executor.submit(self._process_item_with_retry, item): idx
-                for idx, item in enumerate(tqdm(items, desc="Submitting tasks", unit="item"))
-            }
-
-            results = [None] * len(items)
-            
-            with tqdm(total=len(items), desc="Processing items", unit="item") as pbar:
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        results[idx] = future.result()
-                    except Exception as e:
-                        self.logger.error(f"Fatal error for index={idx}: {e}")
-                        results[idx] = {
-                            **items[idx], 
-                            self.output_refined_question_key: items[idx][self.input_question_key]
-                        }
-                    pbar.update(1)
-
-        results = [r for r in results if r is not None]
+        indexed_items = list(enumerate(items))
         
-        if len(results) != len(items):
-            self.logger.warning(f"Results count mismatch: expected {len(items)}, got {len(results)}")
+        batches = [indexed_items[i:i + batch_size] for i in range(0, len(indexed_items), batch_size)]
+        self.logger.info(f"Processing {len(items)} items in {len(batches)} batches of size {batch_size}")
+        
+        all_results = [None] * len(items)
+        
+        for _, batch in enumerate(tqdm(batches, desc="Processing batches")):
+            batch_results = self._process_batch_with_retry(batch)
+            
+            for idx, result in batch_results:
+                all_results[idx] = result
+        
+        results = [r for r in all_results if r is not None]
         
         output_file = storage.write(pd.DataFrame(results))
         self.logger.info(f"Refined questions saved to {output_file}")

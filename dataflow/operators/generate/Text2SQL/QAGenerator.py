@@ -1,4 +1,4 @@
-from typing import Dict, Union, Optional, Tuple    
+from typing import Dict, Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import sqlite3
@@ -15,14 +15,13 @@ from dataflow.utils.storage import DataFlowStorage
 
 
 @OPERATOR_REGISTRY.register()
-class PromptGenerator(OperatorABC):
-    def __init__(self, llm_serving: LLMServingABC, db_root_path: str, num_threads: int = 5, timeout: int = 60):
+class QAGenerator(OperatorABC):
+    def __init__(self, llm_serving: LLMServingABC, db_root_path: str, batch_size: int = 50):
         self.llm_serving = llm_serving
         self.prompt = FinalPromptGeneration()
         self.cot_output = Text2SQLCotPrompt()
-        self.num_threads = num_threads
-        self.timeout = timeout
         self.db_root_path = db_root_path
+        self.batch_size = batch_size
         self.logger = get_logger()
 
     @staticmethod
@@ -42,7 +41,6 @@ class PromptGenerator(OperatorABC):
                 "- input_key: 输入数据主键（如：data）\n"
                 "- input_dbid_key: 数据库ID键（如：db_id）\n"
                 "- db_root_path: 数据库根目录（如：/mnt/public/data/.../dev_databases）\n"
-                "- num_threads: 多线程并行数\n\n"
                 "输出参数：\n"
                 "- output_sft_prompt_key: SFT提示词\n"
                 "- output_rl_prompt_key: RL提示词\n"
@@ -63,7 +61,6 @@ class PromptGenerator(OperatorABC):
                 "- input_key: Main key for input data (e.g., 'data')\n"
                 "- input_dbid_key: Key for database ID (e.g., 'db_id')\n"
                 "- db_root_path: Root path of the databases (e.g., '/mnt/public/data/.../dev_databases')\n"
-                "- num_threads: Number of parallel threads\n\n"
                 "Output parameters:\n"
                 "- output_sft_prompt_key: SFT prompt\n"
                 "- output_rl_prompt_key: RL prompt\n"
@@ -161,46 +158,67 @@ class PromptGenerator(OperatorABC):
         
         return None, False
 
-    def _process_item_with_retry(self, item: Dict, retry_count: int = 0, max_retries: int = 3) -> str:
-        db_id = item.get(self.input_dbid_key)
-        gold_sql = item.get(self.input_sql_key)
-        db_path = os.path.join(self.db_root_path.rstrip('/'), db_id, f"{db_id}.sqlite")
-        prompt = self.generate_cot_synthesis_prompts(item, False)
+    def _process_batch(self, batch_items: List[Dict]) -> List[Dict]:
+        batch_results = []
+        for item in batch_items:
+            sft_prompt = self.generate_prompt(item, prompt_type="omni-sql")
+            rl_prompt = self.generate_prompt(item, prompt_type="dail-sql")
+            batch_results.append({
+                **item,
+                self.output_sft_prompt_key: sft_prompt if sft_prompt else '',
+                self.output_rl_prompt_key: rl_prompt if rl_prompt else '',
+                self.output_cot_key: '' 
+            })
         
-        while retry_count <= max_retries:
+        max_retries = 3
+        for retry_count in range(max_retries + 1):
+            cot_prompts = []
+            items_to_process = []
+            
+            for i, item in enumerate(batch_items):
+                if not batch_results[i][self.output_cot_key]: 
+                    cot_prompt = self.generate_cot_synthesis_prompts(item, False)
+                    cot_prompts.append(cot_prompt)
+                    items_to_process.append((i, item))
+            
+            if not cot_prompts:
+                break
+                
             try:
-                response = self.llm_serving.generate_from_input([prompt])
-                parsed_response, flag = self._parse_response(response[0], gold_sql, db_path)
+                cot_responses = self.llm_serving.generate_from_input(cot_prompts)
                 
-                if flag:
-                    return parsed_response if parsed_response else ""
-                
-                retry_count += 1
+                for (i, item), response in zip(items_to_process, cot_responses):
+                    db_id = item.get(self.input_dbid_key)
+                    gold_sql = item.get(self.input_sql_key)
+                    db_path = os.path.join(self.db_root_path.rstrip('/'), db_id, f"{db_id}.sqlite")
+                    
+                    parsed_response, flag = self._parse_response(response, gold_sql, db_path)
+                    
+                    if flag and parsed_response:
+                        batch_results[i][self.output_cot_key] = parsed_response
+                        
             except Exception as e:
-                self.logger.warning(f"Attempt {retry_count} failed: {e}")
-                retry_count += 1
-
-        try:
-            backup_prompt = self.generate_cot_synthesis_prompts(item, True)
-            backup_response = self.llm_serving.generate_from_input([backup_prompt])
-            parsed_backup_response, success = self._parse_backup_response(backup_response[0])
-            return parsed_backup_response if success and parsed_backup_response else ""
-        except Exception as e:
-            self.logger.error(f"Backup processing failed: {e}")
-            return ""
-
-    
-    def _process_item(self, item: Dict) -> Dict: 
-        sft_prompt = self.generate_prompt(item, prompt_type="omni-sql")
-        rl_prompt = self.generate_prompt(item, prompt_type="dail-sql")
-        cot_output = self._process_item_with_retry(item)
-
-        return {
-            **item,
-            self.output_sft_prompt_key: sft_prompt if sft_prompt else '',
-            self.output_rl_prompt_key: rl_prompt if rl_prompt else '',
-            self.output_cot_key: cot_output if cot_output else ''
-        }
+                self.logger.warning(f"Batch processing attempt {retry_count} failed: {e}")
+        
+        backup_prompts = []
+        backup_indices = []
+        
+        for i, item in enumerate(batch_items):
+            if not batch_results[i][self.output_cot_key]:
+                backup_prompt = self.generate_cot_synthesis_prompts(item, True)
+                backup_prompts.append(backup_prompt)
+                backup_indices.append(i)
+        
+        if backup_prompts:
+            try:
+                backup_responses = self.llm_serving.generate_from_input(backup_prompts)
+                for i, response in zip(backup_indices, backup_responses):
+                    parsed_backup, success = self._parse_backup_response(response)
+                    batch_results[i][self.output_cot_key] = parsed_backup if success and parsed_backup else ''
+            except Exception as e:
+                self.logger.error(f"Backup batch processing failed: {e}")
+        
+        return batch_results
 
     def run(self, storage: DataFlowStorage, 
             input_sql_key: str = "SQL",
@@ -222,32 +240,12 @@ class PromptGenerator(OperatorABC):
         self.logger.info("Starting prompt generation...")
         raw_dataframe = storage.read("dataframe")
         items = raw_dataframe.to_dict('records')
-            
-        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
-            futures = {
-                executor.submit(self._process_item, item): idx
-                for idx, item in enumerate(tqdm(items, desc="Submitting tasks", unit="item"))
-            }
+        final_results = []
 
-            results = [None] * len(items)
-            
-            with tqdm(total=len(futures), desc="Processing", unit="item") as pbar:
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        results[idx] = future.result()
-                    except Exception as e:
-                        self.logger.error(f"Error processing index={idx}: {e}")
-                        results[idx] = {
-                            **items[idx], 
-                            self.output_sft_prompt_key: "", 
-                            self.output_rl_prompt_key: "",
-                            self.output_cot_key: ""
-                        }
-                    
-                    pbar.update(1)
-
-        final_results = [r for r in results if r is not None]
+        for i in range(0, len(items), self.batch_size):
+            batch_items = items[i:i + self.batch_size]
+            batch_results = self._process_batch(batch_items)
+            final_results.extend(batch_results)
         
         if len(final_results) != len(items):
             self.logger.warning(f"Results count mismatch: expected {len(items)}, got {len(final_results)}")

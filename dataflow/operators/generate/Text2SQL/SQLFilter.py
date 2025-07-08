@@ -2,10 +2,8 @@ from tqdm import tqdm
 import sqlite3
 import sys
 import re
-import pandas as pd
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import copy
 from func_timeout import func_timeout, FunctionTimedOut
 from dataflow.prompts.text2sql import TextSQLConsistencyPrompt
 from dataflow.utils.registry import OPERATOR_REGISTRY
@@ -17,12 +15,13 @@ from dataflow.utils.storage import DataFlowStorage
 
 @OPERATOR_REGISTRY.register()
 class SQLFilter(OperatorABC):
-    def __init__(self, llm_serving: LLMServingABC, db_root_path: str, num_cpus: int = 20, meta_time_out: int = 120):
+    def __init__(self, llm_serving: LLMServingABC, db_root_path: str, meta_time_out: int = 120, batch_size: int = 50):
         self.llm_serving = llm_serving     
         self.prompt = TextSQLConsistencyPrompt()
         self.db_root_path = db_root_path
-        self.num_cpus = num_cpus
+        self.num_cpus = os.cpu_count() if os.cpu_count() else 20
         self.meta_time_out = meta_time_out
+        self.batch_size = batch_size
         self.logger = get_logger()
         
     @staticmethod
@@ -152,14 +151,6 @@ class SQLFilter(OperatorABC):
             used_prompt = self.prompt.text_sql_consistency_prompt(question, sql)
             formatted_prompts.append(used_prompt.strip())
         return formatted_prompts
-    
-    def process_single_question(self, question):
-        try:
-            result = self.llm_serving.generate_from_input([question])
-            return result[0] if result else ""
-        except Exception as e:
-            self.logger.error(f"Error processing question: {e}")
-            return ""
 
     def run(self, storage: DataFlowStorage,
             input_sql_key: str = "SQL",
@@ -172,7 +163,6 @@ class SQLFilter(OperatorABC):
         self.input_question_key = input_question_key
 
         dataframe = storage.read("dataframe")
-        original_count = len(dataframe)
 
         datas = dataframe.to_dict('records')
         exec_results = self.run_sqls_parallel(datas, self.db_root_path, self.num_cpus, self.meta_time_out)
@@ -197,33 +187,36 @@ class SQLFilter(OperatorABC):
             output_file = storage.write(empty_df)
             return []
         
-        self.logger.info("Step 2: Checking consistency between questions and SQL...")
         sql_passed_df = dataframe.loc[sql_success_indices].copy()
-        formatted_prompts = self._reformat_prompt(sql_passed_df)
         
-        try:
-            responses = self.llm_serving.generate_from_input(formatted_prompts)
-            
-            if len(responses) != len(formatted_prompts):
-                self.logger.warning(f"Expected {len(formatted_prompts)} responses but got {len(responses)}")
-                while len(responses) < len(formatted_prompts):
-                    responses.append("")
-        except Exception as e:
-            self.logger.error(f"Error in batch LLM processing: {e}")
-            responses = [""] * len(formatted_prompts)
-        
-        consistency_failed_count = 0
-        consistency_passed_count = 0
         final_valid_indices = []
-        
-        for i, (original_idx, response) in enumerate(zip(sql_success_indices, responses)):
-            conclusion, reason = self._parse_consistency_response(response)
+        total_batches = (len(sql_passed_df) + self.batch_size - 1) // self.batch_size
+        for batch_start in range(0, len(sql_passed_df), self.batch_size):
+            current_batch = batch_start // self.batch_size + 1
+            self.logger.info(f"Processing consistency check batch {current_batch}/{total_batches}")
             
-            if conclusion is True:
-                consistency_passed_count += 1
-                final_valid_indices.append(original_idx)
-            else:
-                consistency_failed_count += 1
+            batch_df = sql_passed_df.iloc[batch_start:batch_start + self.batch_size]
+            batch_indices = sql_success_indices[batch_start:batch_start + self.batch_size]
+            formatted_prompts = self._reformat_prompt(batch_df)
+            try:
+                responses = self.llm_serving.generate_from_input(formatted_prompts)
+                if len(responses) != len(formatted_prompts):
+                    self.logger.warning(f"Expected {len(formatted_prompts)} responses but got {len(responses)}")
+                    while len(responses) < len(formatted_prompts):
+                        responses.append("")
+            except Exception as e:
+                self.logger.error(f"Error in batch LLM processing: {e}")
+                responses = [""] * len(formatted_prompts)
+            
+            for original_idx, response in zip(batch_indices, responses):
+                conclusion, _ = self._parse_consistency_response(response)
+                
+                if conclusion is True:
+                    final_valid_indices.append(original_idx)
+
+        consistency_passed = len(final_valid_indices)
+        consistency_failed = len(sql_success_indices) - consistency_passed
+        self.logger.info(f"Consistency check results: {consistency_passed} passed, {consistency_failed} failed")
         
         if final_valid_indices:
             filtered_dataframe = dataframe.loc[final_valid_indices].copy()
