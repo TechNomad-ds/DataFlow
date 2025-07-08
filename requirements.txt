@@ -24,6 +24,7 @@ nltk
 colorama
 # text2sql
 func_timeout
+sqlglot
 # general text
 fasttext-wheel
 kenlm

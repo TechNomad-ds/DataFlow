@@ -133,7 +133,7 @@ class Text2SQLPipeline():
             output_difficulty_key="sql_execution_difficulty"
         )
         
-        
-model = Text2SQLPipeline()
-model.forward()
+if __name__ == "__main__":
+    model = Text2SQLPipeline()
+    model.forward()
 

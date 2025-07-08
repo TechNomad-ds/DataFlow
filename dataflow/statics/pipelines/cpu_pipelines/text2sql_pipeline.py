@@ -56,7 +56,7 @@ class Text2SQLPipeline():
             output_whole_format_schema_key="whole_format_schema"
         )
         
-        
-model = Text2SQLPipeline()
-model.forward()
+if __name__ == "__main__":
+    model = Text2SQLPipeline()
+    model.forward()
 
