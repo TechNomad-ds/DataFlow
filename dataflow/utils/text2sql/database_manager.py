@@ -129,7 +129,7 @@ class SQLiteConnector(DatabaseConnector):
                 try:
                     cursor.close()
                 except:
-                    pass  # 确保cursor关闭不会抛出异常
+                    pass
         
         query_thread = threading.Thread(target=execute_query, daemon=True)
         query_thread.start()
@@ -336,7 +336,6 @@ class MySQLConnector(DatabaseConnector):
                 cursor.execute(sql)
                 results = cursor.fetchall()
                 
-                # 确保返回列表格式
                 if isinstance(results, tuple):
                     results = list(results)
                 elif not isinstance(results, list):
@@ -378,7 +377,6 @@ class MySQLConnector(DatabaseConnector):
                 raise TimeoutError(f"MySQL query execution timed out: {str(exc)}")
             raise exc
         
-        # 获取结果
         if not result_queue.empty():
             return result_queue.get()
         
@@ -1055,11 +1053,8 @@ class BatchOperationExecutor:
             completed_futures = set()
             
             total_ops = len(operations)
-            # 修改：全局timeout基于所有operations的timeout总和（加20%缓冲），最小60s，最大1800s
             total_timeout = sum(op.timeout for op in operations) * 1.2
             timeout = min(1800, max(60, total_timeout))
-            
-            # self.logger.info(f"Batch operation timeout set to {timeout}s for {total_ops} operations")
             
             start_time = time.time()
             
@@ -1158,7 +1153,6 @@ class BatchOperationExecutor:
                     try:
                         start_time = time.time()
                         
-                        # 修改：per-operation设置timeout（如果connector支持），使用op.timeout
                         if hasattr(connector, 'set_query_timeout'):
                             try:
                                 connector.set_query_timeout(conn, op.timeout)
@@ -1166,7 +1160,6 @@ class BatchOperationExecutor:
                             except Exception as e:
                                 self.logger.warning(f"Failed to set query timeout for operation {op.operation_id} in {db_id}: {e}")
                         
-                        # 修改：传递op.timeout（而非unified）
                         result = self._execute_single_operation_with_db_timeout(conn, connector, op, op.timeout)
                         result.execution_time = time.time() - start_time
                         results.append(result)
@@ -1510,7 +1503,6 @@ class DatabaseManager:
         return self.connection_pools[db_id]
 
     def _create_error_response(self, error_msg: str) -> Dict[str, Any]:
-        """创建统一的错误响应格式"""
         return {
             'success': False,
             'error': error_msg,
@@ -2196,10 +2188,8 @@ class DatabaseManager:
         discovered_count = 0
         
         try:
-            # 移除database参数进行连接
             temp_config = {k: v for k, v in self.config.items() if k != 'database'}
             
-            # 添加连接重试机制
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -2211,15 +2201,13 @@ class DatabaseManager:
                     time.sleep(1)
             
             try:
-                # 测试连接
                 if not connector.validate_connection(conn):
                     raise Exception("MySQL connection validation failed")
                 
-                # 获取数据库列表
                 databases = connector.execute_query(conn, "SHOW DATABASES")
                 system_dbs = {
                     'information_schema', 'mysql', 'performance_schema', 'sys',
-                    'test'  # 通常也要排除test数据库
+                    'test'
                 }
                 
                 for db_row in databases:
