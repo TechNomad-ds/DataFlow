@@ -15,6 +15,8 @@ import time
 import concurrent.futures
 import hashlib
 from enum import Enum
+import pymysql.cursors
+from contextlib import contextmanager
 
 class OperationType(Enum):
     EXECUTE_QUERY = "execute_query"
@@ -89,14 +91,9 @@ class SQLiteConnector(DatabaseConnector):
         try:
             timeout_ms = int(timeout_seconds * 1000)
             connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")
-            
-            try:
-                connection.execute(f"PRAGMA statement_timeout = {timeout_ms}")
-            except sqlite3.OperationalError:
-                pass
-                
+
         except Exception as e:
-            pass
+            get_logger().warning(f"Failed to set SQLite timeout: {str(e)}")
     
     def validate_connection(self, connection: sqlite3.Connection) -> bool:
         try:
@@ -106,11 +103,7 @@ class SQLiteConnector(DatabaseConnector):
             return False
     
     def execute_query_with_timeout(self, connection: sqlite3.Connection, sql: str, timeout_seconds: float) -> List:
-        import signal
         import threading
-        
-        def timeout_handler(signum, frame):
-            raise TimeoutError(f"Query execution exceeded {timeout_seconds} seconds")
         
         cursor = connection.cursor()
         result_container = {'result': None, 'error': None, 'completed': False}
@@ -123,7 +116,7 @@ class SQLiteConnector(DatabaseConnector):
                 if results and hasattr(results[0], 'keys'):
                     result_container['result'] = [self._process_row_nulls(dict(row)) for row in results]
                 elif results:
-                    columns = [description[0] for description in cursor.description]
+                    columns = [description[0] for description in cursor.description] if cursor.description else []
                     result_container['result'] = [self._process_row_nulls(dict(zip(columns, row))) for row in results]
                 else:
                     result_container['result'] = []
@@ -133,13 +126,17 @@ class SQLiteConnector(DatabaseConnector):
             except Exception as e:
                 result_container['error'] = str(e)
             finally:
-                cursor.close()
+                try:
+                    cursor.close()
+                except:
+                    pass  # 确保cursor关闭不会抛出异常
         
         query_thread = threading.Thread(target=execute_query, daemon=True)
         query_thread.start()
         query_thread.join(timeout=timeout_seconds)
         
         if query_thread.is_alive():
+            get_logger().warning(f"SQLite query timed out after {timeout_seconds}s, but thread may continue running (SQLite limitation).")
             raise TimeoutError(f"SQLite query execution exceeded {timeout_seconds} seconds")
         
         if result_container['error']:
@@ -273,131 +270,337 @@ class SQLiteConnector(DatabaseConnector):
         else:
             return 'text'
 
+
 class MySQLConnector(DatabaseConnector):
     
     def connect(self, connection_info: Dict) -> pymysql.Connection:
-        return pymysql.connect(**connection_info, connect_timeout=2)
+        config = {
+            'connect_timeout': 5,
+            'read_timeout': 30,
+            'write_timeout': 30,
+            'charset': 'utf8mb4',
+            'autocommit': True,
+            'cursorclass': pymysql.cursors.DictCursor,
+            **connection_info
+        }
+        
+        try:
+            conn = pymysql.connect(**config)
+            with conn.cursor() as cursor:
+                cursor.execute("SET SESSION wait_timeout = 300")
+                cursor.execute("SET SESSION interactive_timeout = 300")
+            return conn
+        except Exception as e:
+            raise Exception(f"MySQL connection failed: {str(e)}")
+    
+    def validate_connection(self, connection: pymysql.Connection) -> bool:
+        try:
+            if not connection or not connection.open:
+                return False
+            
+            connection.ping(reconnect=False)
+            
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                result = cursor.fetchone()
+                return result is not None
+                
+        except (pymysql.Error, AttributeError, Exception):
+            return False
     
     def set_query_timeout(self, connection: pymysql.Connection, timeout_seconds: float):
         try:
-            cursor = connection.cursor()
-            timeout_ms = int(timeout_seconds * 1000)
-            cursor.execute(f"SET SESSION max_execution_time = {timeout_ms}")
-            cursor.close()
-        except Exception as e:
-            pass
+            with connection.cursor() as cursor:
+                timeout_ms = max(1000, int(timeout_seconds * 1000)) 
+                
+                cursor.execute(f"SET SESSION max_execution_time = {timeout_ms}")
+                
+                cursor.execute(f"SET SESSION net_read_timeout = {max(30, int(timeout_seconds))}")
+                cursor.execute(f"SET SESSION net_write_timeout = {max(30, int(timeout_seconds))}")
+                
+        except pymysql.Error as e:
+            if "Unknown system variable" not in str(e):
+                raise Exception(f"Failed to set MySQL timeout: {e}")
     
     def execute_query_with_timeout(self, connection: pymysql.Connection, sql: str, timeout_seconds: float) -> List:
         import threading
+        import queue
         
-        result_container = {'result': None, 'error': None, 'completed': False}
+        result_queue = queue.Queue()
+        exception_queue = queue.Queue()
         
         def execute_query():
             cursor = None
             try:
-                cursor = connection.cursor(pymysql.cursors.DictCursor)
+                cursor = connection.cursor()
                 cursor.execute(sql)
-                result_container['result'] = cursor.fetchall()
-                result_container['completed'] = True
+                results = cursor.fetchall()
+                
+                # 确保返回列表格式
+                if isinstance(results, tuple):
+                    results = list(results)
+                elif not isinstance(results, list):
+                    results = [results] if results else []
+                
+                result_queue.put(results)
+                
             except Exception as e:
-                result_container['error'] = str(e)
+                exception_queue.put(e)
             finally:
                 if cursor:
-                    cursor.close()
+                    try:
+                        cursor.close()
+                    except:
+                        pass
         
         query_thread = threading.Thread(target=execute_query, daemon=True)
         query_thread.start()
         query_thread.join(timeout=timeout_seconds)
         
         if query_thread.is_alive():
+            get_logger().warning(f"MySQL query timed out after {timeout_seconds}s, attempting cancel but thread may hang (MySQL limitation).")
             try:
                 connection.cancel()
             except:
                 pass
+            
+            try:
+                connection.close()
+            except:
+                pass
+                
             raise TimeoutError(f"MySQL query execution exceeded {timeout_seconds} seconds")
         
-        if result_container['error']:
-            if 'max_execution_time' in result_container['error'].lower():
-                raise TimeoutError(f"MySQL query execution exceeded {timeout_seconds} seconds")
-            raise Exception(result_container['error'])
+        if not exception_queue.empty():
+            exc = exception_queue.get()
+            error_msg = str(exc).lower()
+            if 'max_execution_time' in error_msg or 'timeout' in error_msg:
+                raise TimeoutError(f"MySQL query execution timed out: {str(exc)}")
+            raise exc
         
-        if not result_container['completed']:
-            raise TimeoutError(f"MySQL query execution timed out after {timeout_seconds} seconds")
+        # 获取结果
+        if not result_queue.empty():
+            return result_queue.get()
         
-        return result_container['result']
+        raise TimeoutError(f"MySQL query execution timed out after {timeout_seconds} seconds")
 
-    def get_execution_plan(self, connection: pymysql.Connection, sql: str) -> List[Any]:
-        cursor = connection.cursor()
-        cursor.execute(f"EXPLAIN {sql}")
-        return cursor.fetchall()
-    
     def execute_query(self, connection: pymysql.Connection, sql: str) -> List:
-        cursor = connection.cursor()
-        cursor.execute(sql)
-        return cursor.fetchall()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(sql)
+            results = cursor.fetchall()
+            
+            if isinstance(results, tuple):
+                return list(results)
+            elif not isinstance(results, list):
+                return [results] if results else []
+            return results
+            
+        except pymysql.Error as e:
+            raise Exception(f"MySQL query execution failed: {str(e)}")
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
+    
+    def get_execution_plan(self, connection: pymysql.Connection, sql: str) -> List[Any]:
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(f"EXPLAIN FORMAT=JSON {sql}")
+                result = cursor.fetchone()
+                if result:
+                    import json
+                    plan_data = json.loads(list(result.values())[0])
+                    return [{'plan': plan_data, 'format': 'json'}]
+            except:
+                cursor.execute(f"EXPLAIN {sql}")
+                results = cursor.fetchall()
+                return list(results) if results else []
+                
+        except pymysql.Error as e:
+            raise Exception(f"MySQL execution plan error: {str(e)}")
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
     
     def get_tables(self, connection: pymysql.Connection) -> List[str]:
-        cursor = connection.cursor()
-        cursor.execute("SHOW TABLES")
-        return [row[0] for row in cursor.fetchall()]
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SHOW TABLES")
+            results = cursor.fetchall()
+            
+            if results:
+                if isinstance(results[0], dict):
+                    table_key = list(results[0].keys())[0]
+                    return [row[table_key] for row in results]
+                else:
+                    return [row[0] for row in results]
+            return []
+            
+        except pymysql.Error as e:
+            raise Exception(f"Failed to get MySQL tables: {str(e)}")
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
     
     def get_table_schema(self, connection: pymysql.Connection, table_name: str) -> Dict:
-        cursor = connection.cursor()
-        database = connection.db.decode('utf-8')
-        
-        cursor.execute("""
-            SELECT column_name, data_type, column_key, is_nullable, column_default
-            FROM information_schema.columns 
-            WHERE table_schema = %s AND table_name = %s
-            ORDER BY ordinal_position
-        """, (database, table_name))
-        columns = cursor.fetchall()
-        
-        schema = {
-            'columns': {},
-            'primary_keys': [],
-            'foreign_keys': []
-        }
-        
-        for col_name, col_type, col_key, is_nullable, col_default in columns:
-            schema['columns'][col_name] = {
-                'type': self._normalize_type(col_type),
-                'raw_type': col_type,
-                'nullable': is_nullable == 'YES',
-                'default': col_default
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            
+            cursor.execute("SELECT DATABASE()")
+            db_result = cursor.fetchone()
+            if isinstance(db_result, dict):
+                database = list(db_result.values())[0]
+            else:
+                database = db_result[0] if db_result else None
+            
+            if not database:
+                raise Exception("No database selected")
+            
+            cursor.execute("""
+                SELECT 
+                    column_name, 
+                    data_type, 
+                    column_key, 
+                    is_nullable, 
+                    column_default,
+                    character_maximum_length,
+                    numeric_precision,
+                    numeric_scale
+                FROM information_schema.columns 
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (database, table_name))
+            
+            columns_info = cursor.fetchall()
+            
+            schema = {
+                'columns': {},
+                'primary_keys': [],
+                'foreign_keys': []
             }
             
-            if col_key == 'PRI':
-                schema['primary_keys'].append(col_name)
-        
-        cursor.execute("""
-            SELECT column_name, referenced_table_name, referenced_column_name
-            FROM information_schema.key_column_usage 
-            WHERE table_schema = %s AND table_name = %s
-            AND referenced_table_name IS NOT NULL
-        """, (database, table_name))
-        foreign_keys = cursor.fetchall()
-        
-        for col_name, ref_table, ref_column in foreign_keys:
-            schema['foreign_keys'].append({
-                'column': col_name,
-                'referenced_table': ref_table,
-                'referenced_column': ref_column
-            })
-        
-        return schema
+            for col_info in columns_info:
+                if isinstance(col_info, dict):
+                    col_name = col_info['column_name']
+                    col_type = col_info['data_type']
+                    col_key = col_info['column_key']
+                    is_nullable = col_info['is_nullable']
+                    col_default = col_info['column_default']
+                    max_length = col_info.get('character_maximum_length')
+                    precision = col_info.get('numeric_precision')
+                    scale = col_info.get('numeric_scale')
+                else:
+                    col_name, col_type, col_key, is_nullable, col_default, max_length, precision, scale = col_info
+                
+                full_type = col_type
+                if max_length and col_type in ('varchar', 'char'):
+                    full_type = f"{col_type}({max_length})"
+                elif precision and col_type in ('decimal', 'numeric'):
+                    if scale:
+                        full_type = f"{col_type}({precision},{scale})"
+                    else:
+                        full_type = f"{col_type}({precision})"
+                
+                schema['columns'][col_name] = {
+                    'type': self._normalize_type(col_type),
+                    'raw_type': full_type,
+                    'nullable': is_nullable == 'YES',
+                    'default': col_default,
+                    'max_length': max_length,
+                    'precision': precision,
+                    'scale': scale
+                }
+                
+                if col_key == 'PRI':
+                    schema['primary_keys'].append(col_name)
+            
+            cursor.execute("""
+                SELECT 
+                    column_name, 
+                    referenced_table_name, 
+                    referenced_column_name,
+                    constraint_name
+                FROM information_schema.key_column_usage 
+                WHERE table_schema = %s 
+                AND table_name = %s
+                AND referenced_table_name IS NOT NULL
+            """, (database, table_name))
+            
+            foreign_keys = cursor.fetchall()
+            
+            for fk_info in foreign_keys:
+                if isinstance(fk_info, dict):
+                    col_name = fk_info['column_name']
+                    ref_table = fk_info['referenced_table_name']
+                    ref_column = fk_info['referenced_column_name']
+                    constraint_name = fk_info['constraint_name']
+                else:
+                    col_name, ref_table, ref_column, constraint_name = fk_info
+                
+                schema['foreign_keys'].append({
+                    'column': col_name,
+                    'referenced_table': ref_table,
+                    'referenced_column': ref_column,
+                    'constraint_name': constraint_name
+                })
+            
+            return schema
+            
+        except pymysql.Error as e:
+            raise Exception(f"Failed to get MySQL table schema for {table_name}: {str(e)}")
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
     
     def get_sample_data(self, connection: pymysql.Connection, table_name: str, limit: int) -> Dict[str, Any]:
-        cursor = connection.cursor()
-        cursor.execute(f'SELECT * FROM `{table_name}` LIMIT {limit}')
-        rows = cursor.fetchall()
-        
-        column_names = [description[0] for description in cursor.description]
-        
-        return {
-            'columns': column_names,
-            'rows': rows
-        }
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            
+            query = f'SELECT * FROM `{table_name}` LIMIT %s'
+            cursor.execute(query, (limit,))
+            rows = cursor.fetchall()
+            
+            if cursor.description:
+                column_names = [desc[0] for desc in cursor.description]
+            else:
+                column_names = []
+            
+            if isinstance(rows, tuple):
+                rows = list(rows)
+            elif not isinstance(rows, list):
+                rows = [rows] if rows else []
+            
+            return {
+                'columns': column_names,
+                'rows': rows
+            }
+            
+        except pymysql.Error as e:
+            raise Exception(f"Failed to get sample data from {table_name}: {str(e)}")
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
     
     def _normalize_type(self, db_type: str) -> str:
         if not db_type:
@@ -406,13 +609,50 @@ class MySQLConnector(DatabaseConnector):
         db_type = db_type.lower()
         
         type_mapping = {
-            'int': 'integer', 'integer': 'integer', 'bigint': 'integer', 'smallint': 'integer',
-            'tinyint': 'integer', 'mediumint': 'integer',
-            'float': 'real', 'double': 'real', 'decimal': 'real', 'numeric': 'real',
-            'varchar': 'text', 'char': 'text', 'text': 'text', 'longtext': 'text',
-            'mediumtext': 'text', 'tinytext': 'text',
-            'date': 'date', 'datetime': 'datetime', 'timestamp': 'datetime', 'time': 'time',
-            'blob': 'blob', 'longblob': 'blob', 'mediumblob': 'blob', 'tinyblob': 'blob'
+            'tinyint': 'integer',
+            'smallint': 'integer', 
+            'mediumint': 'integer',
+            'int': 'integer',
+            'integer': 'integer',
+            'bigint': 'integer',
+            
+            'float': 'real',
+            'double': 'real',
+            'real': 'real',
+            'decimal': 'real',
+            'numeric': 'real',
+            
+            'char': 'text',
+            'varchar': 'text',
+            'text': 'text',
+            'tinytext': 'text',
+            'mediumtext': 'text',
+            'longtext': 'text',
+            
+            'date': 'date',
+            'time': 'time', 
+            'datetime': 'datetime',
+            'timestamp': 'datetime',
+            'year': 'integer',
+            
+            'binary': 'blob',
+            'varbinary': 'blob',
+            'blob': 'blob',
+            'tinyblob': 'blob',
+            'mediumblob': 'blob',
+            'longblob': 'blob',
+            
+            'json': 'text',
+            
+            'geometry': 'blob',
+            'point': 'blob',
+            'linestring': 'blob',
+            'polygon': 'blob',
+            
+            'enum': 'text',  
+            'set': 'text',  
+            'bit': 'integer',  
+            'boolean': 'integer'  
         }
         
         return type_mapping.get(db_type, 'text')
@@ -571,10 +811,15 @@ class ConnectionPool:
         self.logger = get_logger()
         
         self.is_sqlite = isinstance(connector, SQLiteConnector)
+        self.is_mysql = isinstance(connector, MySQLConnector)
         if self.is_sqlite:
             self.max_connections = min(3, max_connections)
             self._sqlite_connections = {}
             self._sqlite_lock = threading.Lock()
+        elif self.is_mysql:
+            self.max_connections = max_connections
+            self._health_check_interval = 60 
+            self._last_health_check = 0
 
     @contextmanager
     def get_connection(self):
@@ -810,7 +1055,9 @@ class BatchOperationExecutor:
             completed_futures = set()
             
             total_ops = len(operations)
-            timeout = min(300, max(60, total_ops * 0.5))
+            # 修改：全局timeout基于所有operations的timeout总和（加20%缓冲），最小60s，最大1800s
+            total_timeout = sum(op.timeout for op in operations) * 1.2
+            timeout = min(1800, max(60, total_timeout))
             
             # self.logger.info(f"Batch operation timeout set to {timeout}s for {total_ops} operations")
             
@@ -894,18 +1141,10 @@ class BatchOperationExecutor:
             
             results = []
             connection_start = time.time()
-            unified_timeout = operations[0].timeout if operations else 30.0
             
             with pool.get_connection() as conn:
                 connection_time = time.time() - connection_start
-                # self.logger.info(f"Got connection for {db_id} in {connection_time:.2f}s, executing {len(operations)} operations with timeout {unified_timeout}s")
-                
-                if hasattr(connector, 'set_query_timeout'):
-                    try:
-                        connector.set_query_timeout(conn, unified_timeout)
-                        self.logger.debug(f"Set query timeout to {unified_timeout}s for database {db_id}")
-                    except Exception as e:
-                        self.logger.warning(f"Failed to set query timeout for {db_id}: {e}")
+                # self.logger.info(f"Got connection for {db_id} in {connection_time:.2f}s, executing {len(operations)} operations")
                 
                 for i, op in enumerate(operations):
                     if self._closed:
@@ -919,19 +1158,28 @@ class BatchOperationExecutor:
                     try:
                         start_time = time.time()
                         
-                        result = self._execute_single_operation_with_db_timeout(conn, connector, op, unified_timeout)
+                        # 修改：per-operation设置timeout（如果connector支持），使用op.timeout
+                        if hasattr(connector, 'set_query_timeout'):
+                            try:
+                                connector.set_query_timeout(conn, op.timeout)
+                                self.logger.debug(f"Set query timeout to {op.timeout}s for operation {op.operation_id} in database {db_id}")
+                            except Exception as e:
+                                self.logger.warning(f"Failed to set query timeout for operation {op.operation_id} in {db_id}: {e}")
+                        
+                        # 修改：传递op.timeout（而非unified）
+                        result = self._execute_single_operation_with_db_timeout(conn, connector, op, op.timeout)
                         result.execution_time = time.time() - start_time
                         results.append(result)
                         
-                        # if result.execution_time > unified_timeout * 0.8:
-                        #     self.logger.warning(f"Slow operation {op.operation_id} took {result.execution_time:.2f}s (timeout: {unified_timeout}s)")
+                        # if result.execution_time > op.timeout * 0.8:
+                        #     self.logger.warning(f"Slow operation {op.operation_id} took {result.execution_time:.2f}s (timeout: {op.timeout}s)")
                             
                     except Exception as e:
                         execution_time = time.time() - start_time
                         error_msg = str(e)
                         
                         if 'timeout' in error_msg.lower() or 'exceeded' in error_msg.lower():
-                            error_msg = f"SQL execution timeout after {unified_timeout}s: {error_msg}"
+                            error_msg = f"SQL execution timeout after {op.timeout}s: {error_msg}"
                         
                         # self.logger.warning(f"Exception in operation {op.operation_id}: {error_msg}")
                         results.append(BatchResult(
@@ -1150,8 +1398,7 @@ class BatchOperationExecutor:
             try:
                 self.executor.shutdown(wait=True, timeout=10)
             except Exception as e:
-                if hasattr(self, 'logger'):
-                    self.logger.warning(f"Error shutting down batch executor: {e}")
+                self.logger.warning(f"Error shutting down batch executor: {e}. Note: Pending queries may not be cancelled properly in SQLite/MySQL timeouts.")
 
 class DatabaseManager:
     
@@ -1261,6 +1508,16 @@ class DatabaseManager:
                     self.logger.debug(f"Created connection pool for database: {db_id}")
         
         return self.connection_pools[db_id]
+
+    def _create_error_response(self, error_msg: str) -> Dict[str, Any]:
+        """创建统一的错误响应格式"""
+        return {
+            'success': False,
+            'error': error_msg,
+            'data': [],
+            'columns': [],
+            'row_count': 0
+        }
 
     def batch_execute_queries(self, queries: List[Dict[str, Any]]) -> List[BatchResult]:
         if not self._initialized:
@@ -1939,20 +2196,38 @@ class DatabaseManager:
         discovered_count = 0
         
         try:
+            # 移除database参数进行连接
             temp_config = {k: v for k, v in self.config.items() if k != 'database'}
             
-            self.logger.debug("Testing MySQL connection...")
-            conn = connector.connect(temp_config)
+            # 添加连接重试机制
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    conn = connector.connect(temp_config)
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    time.sleep(1)
             
             try:
-                test_result = connector.execute_query(conn, "SELECT 1 as test")
-                if not test_result or test_result[0][0] != 1:
-                    raise Exception("MySQL connection test failed")
+                # 测试连接
+                if not connector.validate_connection(conn):
+                    raise Exception("MySQL connection validation failed")
                 
+                # 获取数据库列表
                 databases = connector.execute_query(conn, "SHOW DATABASES")
-                system_dbs = {'information_schema', 'mysql', 'performance_schema', 'sys'}
+                system_dbs = {
+                    'information_schema', 'mysql', 'performance_schema', 'sys',
+                    'test'  # 通常也要排除test数据库
+                }
                 
-                for (db_name,) in databases:
+                for db_row in databases:
+                    if isinstance(db_row, dict):
+                        db_name = list(db_row.values())[0]
+                    else:
+                        db_name = db_row[0]
+                    
                     if db_name not in system_dbs:
                         try:
                             if self._test_mysql_database_access(connector, temp_config, db_name):
@@ -1962,7 +2237,8 @@ class DatabaseManager:
                                     connection_info={**self.config, 'database': db_name},
                                     metadata={
                                         'host': self.config.get('host'),
-                                        'port': self.config.get('port', 3306)
+                                        'port': self.config.get('port', 3306),
+                                        'charset': self.config.get('charset', 'utf8mb4')
                                     }
                                 )
                                 self.registry.register_database(db_info)
@@ -1970,7 +2246,6 @@ class DatabaseManager:
                                 self.logger.debug(f"Registered MySQL database: {db_name}")
                             else:
                                 self.logger.debug(f"Skipped inaccessible MySQL database: {db_name}")
-                                
                         except Exception as e:
                             self.logger.warning(f"Failed to register MySQL database {db_name}: {e}")
                 
@@ -1981,21 +2256,24 @@ class DatabaseManager:
                     conn.close()
                 except Exception as e:
                     self.logger.warning(f"Error closing MySQL discovery connection: {e}")
-                
+                    
         except Exception as e:
-            self.logger.warning(f"Error discovering MySQL databases: {e}")
+            self.logger.error(f"Error discovering MySQL databases: {e}")
             raise
-    
+
     def _test_mysql_database_access(self, connector, base_config: dict, db_name: str) -> bool:
         try:
             test_config = {**base_config, 'database': db_name}
             test_conn = connector.connect(test_config)
             try:
                 connector.execute_query(test_conn, "SELECT 1")
+                tables = connector.get_tables(test_conn)
+                
                 return True
             finally:
                 test_conn.close()
-        except Exception:
+        except Exception as e:
+            self.logger.debug(f"Database {db_name} access test failed: {e}")
             return False
     
     # ==================== Single Operation Interface (Uniform Implementation) ====================
@@ -2032,7 +2310,7 @@ class DatabaseManager:
             self.logger.warning(f"Error executing {operation_type.value} for {db_id}: {e}")
             return self._create_error_response(str(e))
 
-    def execute_query(self, db_id: str, sql: str, timeout: float = 2.0) -> Dict[str, Any]:
+    def execute_query(self, db_id: str, sql: str, timeout: float = 30.0) -> Dict[str, Any]:
         return self._execute_single_operation_template(OperationType.EXECUTE_QUERY, db_id, sql, timeout)
     
     def analyze_sql_execution_plan(self, db_id: str, sql: str, timeout: float = 2.0) -> Dict[str, Any]:
