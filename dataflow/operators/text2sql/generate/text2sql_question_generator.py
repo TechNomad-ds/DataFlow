@@ -160,7 +160,7 @@ class Text2SQLQuestionGenerator(OperatorABC):
             for _ in range(self.question_candidates_num):
                 prompts.append(prompt)
 
-        # Phase 3: LLM generation (tracked in LLM serving layer)
+        # Phase 3: LLM generation
         responses = self.llm_serving.generate_from_input(prompts, system_prompt="You are a helpful assistant.")
         if len(responses) != len(prompts):
             self.logger.warning(

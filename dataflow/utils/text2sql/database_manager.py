@@ -360,6 +360,9 @@ class DatabaseManager:
         """Check if database exists"""
         return db_id in self.databases
 
+    def list_databases(self) -> List[str]:
+        """List all available databases"""
+        return list(self.databases.keys())
 
     def _create_error_result(self, error_msg: str) -> Dict[str, Any]:
         """Create standardized error result"""

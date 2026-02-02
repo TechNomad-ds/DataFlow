@@ -2,7 +2,7 @@ from typing import Dict, Union
 from tqdm import tqdm
 import re
 import time
-from dataflow.prompts.text2sql import SQLCorrespondenceFilterPrompt
+from dataflow.prompts.text2sql import Text2SQLCorrespondenceFilterPrompt
 from dataflow.core.prompt import prompt_restrict, DIYPromptABC
 from dataflow.utils.registry import OPERATOR_REGISTRY
 from dataflow import get_logger
@@ -10,20 +10,19 @@ from dataflow.core import OperatorABC
 from dataflow.core import LLMServingABC
 from dataflow.utils.storage import DataFlowStorage
 from dataflow.utils.text2sql.database_manager import DatabaseManager
-from dataflow.utils.metrics_collector import get_metrics_collector
 
-@prompt_restrict(SQLCorrespondenceFilterPrompt)
+@prompt_restrict(Text2SQLCorrespondenceFilterPrompt)
 
 @OPERATOR_REGISTRY.register()
-class SQLCorrespondenceFilter(OperatorABC):
+class Text2SQLCorrespondenceFilter(OperatorABC):
     def __init__(self, 
             llm_serving: LLMServingABC, 
             database_manager: DatabaseManager,
-            prompt_template: Union[SQLCorrespondenceFilterPrompt, DIYPromptABC] = None
+            prompt_template: Union[Text2SQLCorrespondenceFilterPrompt, DIYPromptABC] = None
         ):
         self.llm_serving = llm_serving
         if prompt_template is None:
-            prompt_template = SQLCorrespondenceFilterPrompt()
+            prompt_template = Text2SQLCorrespondenceFilterPrompt()
         self.prompt_template = prompt_template
         self.database_manager = database_manager
         self.logger = get_logger()
@@ -73,11 +72,6 @@ class SQLCorrespondenceFilter(OperatorABC):
             input_question_key: str = "question",
             input_evidence_key: str = "evidence",
         ): 
-        collector = get_metrics_collector()
-        operator_name = "SQLCorrespondenceFilter"
-        if collector:
-            collector.start_operator(operator_name)
-        
         self.input_sql_key = input_sql_key
         self.input_db_id_key = input_db_id_key
         self.input_question_key = input_question_key
@@ -87,7 +81,7 @@ class SQLCorrespondenceFilter(OperatorABC):
         total_len = len(dataframe)
         
         prompts = []
-        prompt_to_row_index = []  # index i -> dataframe row index for prompt i
+        prompt_to_row_index = []  
         for row_index, row in tqdm(dataframe.iterrows(), total=len(dataframe), desc="Processing consistency check"):
             sql = row[self.input_sql_key]
             question = row.get(self.input_question_key)

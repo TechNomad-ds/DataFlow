@@ -8,7 +8,6 @@ from dataflow import get_logger
 from dataflow.core import OperatorABC
 from dataflow.utils.storage import DataFlowStorage
 from dataflow.utils.text2sql.database_manager import DatabaseManager
-from dataflow.utils.metrics_collector import get_metrics_collector
 
 
 @OPERATOR_REGISTRY.register()
@@ -40,11 +39,6 @@ class SQLExecutabilityFilter(OperatorABC):
             input_sql_key: str = "SQL",
             input_db_id_key: str = "db_id"
         ):
-        collector = get_metrics_collector()
-        operator_name = "SQLExecutabilityFilter"
-        if collector:
-            collector.start_operator(operator_name)
-        
         self.input_sql_key = input_sql_key
         self.input_db_id_key = input_db_id_key
         dataframe = storage.read("dataframe")
@@ -52,35 +46,24 @@ class SQLExecutabilityFilter(OperatorABC):
         
         # Record input data count
         input_count = len(dataframe)
-        if collector:
-            collector.record_input_data_count(input_count, operator_name)
         
         # Phase 1: Database check
-        db_check_start = time.time()
         db_id_need_to_check = dataframe[input_db_id_key].unique()
         for db_id in db_id_need_to_check:
             if not self.database_manager.database_exists(db_id):
                 self.logger.warning(f"Database {db_id} not found in registry, please check the database folder")
                 continue
-        if collector:
-            collector.record_time("db_operation", time.time() - db_check_start, operator_name)
         
         self.logger.info(f"Start to filter {len(dataframe)} SQLs")
 
         # Phase 2: SQL filtering
-        filter_start = time.time()
         phase1_mask = dataframe[input_sql_key].apply(self.filter_select_sql)
         phase1_df = dataframe[phase1_mask].copy()
-        if collector:
-            collector.record_time("post_process", time.time() - filter_start, operator_name)
 
         self.logger.info(f"Phase 1 completed: {len(phase1_df)}/{len(dataframe)} SQLs passed initial filter")
 
         if phase1_df.empty:
             output_file = storage.write(phase1_df)
-            if collector:
-                collector.record_items_processed(0, operator_name)
-                collector.end_operator()
             return []
 
         sql_triples = list(zip(phase1_df[input_db_id_key].tolist(),
@@ -89,8 +72,6 @@ class SQLExecutabilityFilter(OperatorABC):
         # Phase 3: SQL execution
         exec_start = time.time()
         execution_results = self.database_manager.batch_explain_queries(sql_triples)
-        if collector:
-            collector.record_time("db_operation", time.time() - exec_start, operator_name)
 
         phase2_mask = [r.success for r in execution_results]
         result_df = phase1_df[phase2_mask].copy()
@@ -100,8 +81,4 @@ class SQLExecutabilityFilter(OperatorABC):
         output_file = storage.write(result_df)
         output_count = len(result_df)
         
-        if collector:
-            collector.record_output_data_count(output_count, operator_name)
-            collector.record_items_processed(output_count, operator_name)
-            collector.end_operator()
         return []

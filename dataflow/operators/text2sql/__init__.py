@@ -4,7 +4,7 @@ if TYPE_CHECKING:
     # filter
     from filter.sql_executability_filter import SQLExecutabilityFilter
     from filter.sql_execution_filter import SQLExecutionFilter
-    from filter.sql_correspondence_filter import SQLCorrespondenceFilter
+    from filter.text2sql_correspondence_filter import Text2SQLCorrespondenceFilter
 
     # generate
     from generate.sql_generator import SQLGenerator

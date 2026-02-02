@@ -11,7 +11,7 @@ from dataflow.core.prompt import PromptABC
 
 
 @PROMPT_REGISTRY.register()
-class SQLCorrespondenceFilterPrompt(PromptABC):
+class Text2SQLCorrespondenceFilterPrompt(PromptABC):
     def __init__(self):
         pass
 
@@ -396,7 +396,7 @@ class SelectSQLGeneratorPrompt(PromptABC):
             db_engine=db_engine,
             column_count=column_count
         )
-        return prompt
+        return prompt, complexity
 
 
 @PROMPT_REGISTRY.register()
