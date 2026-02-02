@@ -82,7 +82,7 @@ def _vote_select(
 
 
 @OPERATOR_REGISTRY.register()
-class CoTVotingOperator(OperatorABC):
+class Text2SQLCoTVotingGenerator(OperatorABC):
     """
     After Text2SQLCoTGenerator, execute SQL for each cot_responses and vote by execution consistency to select final cot_reasoning.
     """

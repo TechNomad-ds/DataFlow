@@ -8,11 +8,12 @@ from dataflow.operators.text2sql import (
     SQLVariationGenerator,
     Text2SQLQuestionGenerator,
     Text2SQLPromptGenerator,
-    Text2SQLCoTGenerator
+    Text2SQLCoTGenerator,
+    Text2SQLCoTVotingGenerator
 )
 from dataflow.operators.text2sql import (
-    SQLExecutionFilter,
-    SQLConsistencyFilter
+    SQLExecutabilityFilter,
+    SQLCorrespondenceFilter
 )
 from dataflow.operators.text2sql import (
     SQLComponentClassifier,
@@ -130,33 +131,33 @@ class Text2SQLRefine_APIPipeline():
             }
         )
         
-        self.sql_execution_filter_step1 = SQLExecutionFilter(
+        self.sql_executability_filter_step1 = SQLExecutabilityFilter(
             database_manager=database_manager
         )
 
-        self.sql_consistency_filter_step2 = SQLConsistencyFilter(
-            llm_serving=self.llm_serving,
-            database_manager=database_manager,
-            prompt_template=SQLConsistencyFilterPrompt()
-        )
-
-        self.sql_variation_generator_step3 = SQLVariationGenerator(
+        self.sql_variation_generator_step2 = SQLVariationGenerator(
             llm_serving=self.llm_serving,
             database_manager=database_manager,
             num_variations=1, # Number of variations to generate for each SQL
             prompt_template=SQLVariationGeneratorPrompt()
         )
 
-        self.sql_execution_filter_step4 = SQLExecutionFilter(
+        self.sql_executability_filter_step3 = SQLExecutabilityFilter(
             database_manager=database_manager
         )
 
-        self.text2sql_question_generator_step5 = Text2SQLQuestionGenerator(
+        self.text2sql_question_generator_step4 = Text2SQLQuestionGenerator(
             llm_serving=self.llm_serving,
             embedding_serving=embedding_serving,
             database_manager=database_manager,
             question_candidates_num=5,
             prompt_template=Text2SQLQuestionGeneratorPrompt()
+        )
+
+        self.sql_correspondence_filter_step5 = SQLCorrespondenceFilter(
+            llm_serving=self.llm_serving,
+            database_manager=database_manager,
+            prompt_template=Text2SQLCorrespondenceFilterPrompt()
         )
 
         self.text2sql_prompt_generator_step6 = Text2SQLPromptGenerator(
@@ -170,12 +171,16 @@ class Text2SQLRefine_APIPipeline():
             prompt_template=Text2SQLCotGeneratorPrompt()
         )
 
-        self.sql_component_classifier_step8 = SQLComponentClassifier(
+        self.sql_cot_voting_generator_step8 = Text2SQLCoTVotingGenerator(
+            database_manager=database_manager
+        )
+
+        self.sql_component_classifier_step9 = SQLComponentClassifier(
             difficulty_thresholds=[2, 4, 6],
             difficulty_labels=['easy', 'medium', 'hard', 'extra']
         )
 
-        self.sql_execution_classifier_step9 = SQLExecutionClassifier(
+        self.sql_execution_classifier_step10 = SQLExecutionClassifier(
             llm_serving=self.llm_serving,
             database_manager=database_manager,
             num_generations=10,
@@ -191,37 +196,38 @@ class Text2SQLRefine_APIPipeline():
         question_key = "question"
         evidence_key = "evidence"
 
-        self.sql_execution_filter_step1.run(
+        self.sql_executability_filter_step1.run(
             storage=self.storage.step(),
             input_sql_key=sql_key,
             input_db_id_key=db_id_key
         )
 
-        self.sql_consistency_filter_step2.run(
-            storage=self.storage.step(),   
-            input_sql_key=sql_key,
-            input_db_id_key=db_id_key,
-            input_question_key=question_key
-        )
-
-        self.sql_variation_generator_step3.run(
+        self.sql_variation_generator_step2.run(
             storage=self.storage.step(),
             input_sql_key=sql_key,
             input_db_id_key=db_id_key
         )
 
-        self.sql_execution_filter_step4.run(
+        self.sql_executability_filter_step3.run(
             storage=self.storage.step(),
             input_sql_key=sql_key,
             input_db_id_key=db_id_key
         )
 
-        self.text2sql_question_generator_step5.run(
+        self.text2sql_question_generator_step4.run(
             storage=self.storage.step(),
             input_sql_key=sql_key,
             input_db_id_key=db_id_key,
             output_question_key=question_key,
             output_evidence_key=evidence_key
+        )
+
+        self.sql_correspondence_filter_step5.run(
+            storage=self.storage.step(),
+            input_sql_key=sql_key,
+            input_db_id_key=db_id_key,
+            input_question_key=question_key,
+            input_evidence_key=evidence_key
         )
 
         self.text2sql_prompt_generator_step6.run(
@@ -241,13 +247,20 @@ class Text2SQLRefine_APIPipeline():
             output_cot_key="cot_reasoning"
         )
 
-        self.sql_component_classifier_step8.run(
+        self.sql_cot_voting_generator_step8.run(
+            storage=self.storage.step(),
+            input_cot_responses_key="cot_responses",
+            input_db_id_key=db_id_key,
+            output_cot_key="cot_reasoning"
+        )
+
+        self.sql_component_classifier_step9.run(
             storage=self.storage.step(),
             input_sql_key=sql_key,
             output_difficulty_key="sql_component_difficulty"
         )
 
-        self.sql_execution_classifier_step9.run(
+        self.sql_execution_classifier_step10.run(
             storage=self.storage.step(),
             input_sql_key=sql_key,
             input_db_id_key=db_id_key,
