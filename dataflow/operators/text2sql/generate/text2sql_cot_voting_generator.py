@@ -1,5 +1,6 @@
 import re
 import random
+from collections import defaultdict
 from typing import Dict, List, Optional, Any, Tuple
 
 import pandas as pd

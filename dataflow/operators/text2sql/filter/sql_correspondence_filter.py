@@ -2,7 +2,7 @@ from typing import Dict, Union
 from tqdm import tqdm
 import re
 import time
-from dataflow.prompts.text2sql import SQLConsistencyFilterPrompt
+from dataflow.prompts.text2sql import SQLCorrespondenceFilterPrompt
 from dataflow.core.prompt import prompt_restrict, DIYPromptABC
 from dataflow.utils.registry import OPERATOR_REGISTRY
 from dataflow import get_logger
@@ -87,8 +87,8 @@ class SQLCorrespondenceFilter(OperatorABC):
         total_len = len(dataframe)
         
         prompts = []
-        final_valid_indices = []
-        for _, row in tqdm(dataframe.iterrows(), total=len(dataframe), desc="Processing consistency check"):
+        prompt_to_row_index = []  # index i -> dataframe row index for prompt i
+        for row_index, row in tqdm(dataframe.iterrows(), total=len(dataframe), desc="Processing consistency check"):
             sql = row[self.input_sql_key]
             question = row.get(self.input_question_key)
             evidence = row.get(self.input_evidence_key, "")
@@ -105,11 +105,13 @@ class SQLCorrespondenceFilter(OperatorABC):
             db_details = "\n\n".join(create_statements)
             prompt = self.prompt_template.build_prompt(question, sql, db_details)
             prompts.append(prompt)
+            prompt_to_row_index.append(row_index)
         responses = self.llm_serving.generate_from_input(prompts, "")
+        final_valid_indices = []
         for idx, response in enumerate(responses):
             conclusion = self._parse_consistency_response(response)
-            if conclusion:
-                final_valid_indices.append(idx)
+            if conclusion and idx < len(prompt_to_row_index):
+                final_valid_indices.append(prompt_to_row_index[idx])
 
         correspondence_passed = len(final_valid_indices)
         self.logger.info(f"Correspondence check results: {correspondence_passed} passed, total {total_len}")

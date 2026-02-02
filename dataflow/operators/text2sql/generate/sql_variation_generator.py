@@ -84,7 +84,9 @@ class SQLVariationGenerator(OperatorABC):
         
         dataframe = storage.read("dataframe")
         self.check_column(dataframe)
-        
+        self.output_sql_variation_type_key = output_sql_variation_type_key
+
+        prompts_and_metadata = []
         # Phase 1: Prompt building
         for _, row in tqdm(dataframe.iterrows(), total=len(dataframe), desc="Generating SQL Variations"):
             try:
@@ -138,4 +140,4 @@ class SQLVariationGenerator(OperatorABC):
         output_count = len(dataframe)
         
         self.logger.info(f"Generated {output_count} records")
-        return []
+        return [self.input_sql_key, self.input_db_id_key, self.output_sql_variation_type_key]

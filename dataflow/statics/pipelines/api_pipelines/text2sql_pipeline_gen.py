@@ -137,7 +137,7 @@ class Text2SQLGeneration_APIPipeline():
             prompt_template=SelectSQLGeneratorPrompt()
         )
 
-        self.sql_execution_filter_step2 = SQLExecutabilityFilter(
+        self.sql_executability_filter_step2 = SQLExecutabilityFilter(
             database_manager=database_manager
         )
 

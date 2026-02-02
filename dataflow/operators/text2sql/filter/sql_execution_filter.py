@@ -79,15 +79,14 @@ class SQLExecutionFilter(OperatorABC):
 
         self.logger.info(f"Phase 1 completed: {len(phase1_passed_indices)}/{len(dataframe)} SQLs passed initial filter")
 
-        db_ids = dataframe[input_db_id_key]
-        sql_list = dataframe[input_sql_key]
-        sql_triples = [(db_id, sql) for db_id, sql in zip(db_ids, sql_list)]
+        phase1_df = dataframe.loc[phase1_passed_indices]
+        sql_triples = list(zip(phase1_df[input_db_id_key].tolist(), phase1_df[input_sql_key].tolist()))
         execution_results = self.database_manager.batch_execute_queries(sql_triples)
 
         final_indices = []
         for idx, exec_result in enumerate(execution_results):
             if exec_result.success:
-                final_indices.append(idx)
+                final_indices.append(phase1_passed_indices[idx])
 
         self.logger.info(f"Filter completed, remaining {len(final_indices)} SQLs out of {len(dataframe)} original SQLs")
 

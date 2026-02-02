@@ -105,12 +105,7 @@ class Text2SQLPromptGenerator(OperatorABC):
         output_df = pd.DataFrame(final_results)
         output_file = storage.write(output_df)
         output_count = len(output_df)
-        
-        if collector:
-            collector.record_output_data_count(output_count, operator_name)
-            collector.record_items_processed(output_count, operator_name)
-            collector.end_operator()
-        
+
         self.logger.info(f"Prompt generation completed, saved to {output_file}")
 
         return [self.output_prompt_key]

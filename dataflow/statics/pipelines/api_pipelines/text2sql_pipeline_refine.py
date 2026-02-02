@@ -20,7 +20,7 @@ from dataflow.operators.text2sql import (
     SQLExecutionClassifier
 )
 from dataflow.prompts.text2sql import (
-    SQLConsistencyFilterPrompt,
+    SQLCorrespondenceFilterPrompt,
     Text2SQLCotGeneratorPrompt,
     Text2SQLQuestionGeneratorPrompt,
     SQLVariationGeneratorPrompt,
@@ -157,7 +157,7 @@ class Text2SQLRefine_APIPipeline():
         self.sql_correspondence_filter_step5 = SQLCorrespondenceFilter(
             llm_serving=self.llm_serving,
             database_manager=database_manager,
-            prompt_template=Text2SQLCorrespondenceFilterPrompt()
+            prompt_template=SQLCorrespondenceFilterPrompt()
         )
 
         self.text2sql_prompt_generator_step6 = Text2SQLPromptGenerator(
