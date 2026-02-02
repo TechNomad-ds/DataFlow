@@ -13,7 +13,7 @@ from dataflow.operators.text2sql import (
 )
 from dataflow.operators.text2sql import (
     SQLExecutabilityFilter,
-    SQLCorrespondenceFilter
+    Text2SQLCorrespondenceFilter
 )
 from dataflow.operators.text2sql import (
     SQLComponentClassifier,
@@ -23,7 +23,8 @@ from dataflow.prompts.text2sql import (
     Text2SQLCotGeneratorPrompt,
     SelectSQLGeneratorPrompt,
     Text2SQLQuestionGeneratorPrompt,
-    Text2SQLPromptGeneratorPrompt
+    Text2SQLPromptGeneratorPrompt,
+    Text2SQLCorrespondenceFilterPrompt
 )
 from dataflow.utils.storage import FileStorage
 from dataflow.serving import APILLMServing_request
@@ -95,14 +96,7 @@ class Text2SQLGeneration_APIPipeline():
             max_workers=100
         )
 
-        # It is recommended to use better LLMs for the generation of Chain-of-Thought (CoT) reasoning process.
-        cot_generation_api_llm_serving = APILLMServing_request(
-            api_url="https://api.openai.com/v1/chat/completions",
-            model_name="gpt-4o", # You can change to a more powerful model for CoT generation
-            max_workers=100
-        )
-
-        embedding_serving = APILLMServing_request(
+        self.embedding_serving = APILLMServing_request(
             api_url="https://api.openai.com/v1/embeddings",
             model_name="text-embedding-ada-002",
             max_workers=100
@@ -143,13 +137,13 @@ class Text2SQLGeneration_APIPipeline():
 
         self.text2sql_question_generator_step3 = Text2SQLQuestionGenerator(
             llm_serving=self.llm_serving,
-            embedding_serving=embedding_serving,
+            embedding_serving=self.embedding_serving,
             database_manager=database_manager,
-            question_candidates_num=5,
+            question_candidates_num=3,
             prompt_template=Text2SQLQuestionGeneratorPrompt()
         )
 
-        self.sql_correspondence_filter_step4 = SQLCorrespondenceFilter(
+        self.text2sql_correspondence_filter_step4 = Text2SQLCorrespondenceFilter(
             llm_serving=self.llm_serving,
             database_manager=database_manager,
             prompt_template=Text2SQLCorrespondenceFilterPrompt()
@@ -161,7 +155,7 @@ class Text2SQLGeneration_APIPipeline():
         )
 
         self.sql_cot_generator_step6 = Text2SQLCoTGenerator(
-            llm_serving=cot_generation_api_llm_serving,
+            llm_serving=self.llm_serving,
             database_manager=database_manager,
             prompt_template=Text2SQLCotGeneratorPrompt()
         )
@@ -193,7 +187,8 @@ class Text2SQLGeneration_APIPipeline():
         self.sql_generator_step1.run(
             storage=self.storage.step(),
             output_sql_key=sql_key,
-            output_db_id_key=db_id_key
+            output_db_id_key=db_id_key,
+            output_sql_complexity_key="sql_complexity_type"
         )
 
         self.sql_executability_filter_step2.run(
@@ -210,7 +205,7 @@ class Text2SQLGeneration_APIPipeline():
             output_evidence_key=evidence_key
         )
         
-        self.sql_correspondence_filter_step4.run(
+        self.text2sql_correspondence_filter_step4.run(
             storage=self.storage.step(),
             input_sql_key=sql_key,
             input_db_id_key=db_id_key,
